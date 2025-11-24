@@ -160,8 +160,15 @@ BACKUP_PROVIDERS: list[BackupProvider] = [
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/var/backups"))
 SCHEDULE = os.environ.get("SCHEDULE", "0 0 * * *")
 SHOW_PROGRESS = sys.stdout.isatty()
-COMPRESSION = os.environ.get("COMPRESSION", "plain")
 INCLUDE_LOGS = bool(os.environ.get("INCLUDE_LOGS"))
+TIMESTAMP = os.environ.get("TIMESTAMP", "").lower() == "true"
+COMPRESS = os.environ.get("COMPRESS", "").lower() == "true"
+
+# Determine compression algorithm
+if COMPRESS:
+    COMPRESSION = os.environ.get("COMPRESSION", "gzip")
+else:
+    COMPRESSION = os.environ.get("COMPRESSION", "plain")
 
 
 def get_backup_provider(container_names: Iterable[str]) -> Optional[BackupProvider]:
@@ -187,6 +194,20 @@ def get_container_names(container: Container) -> Iterable[str]:
     return names
 
 
+def generate_backup_filename(container_name: str, file_extension: str, compression_extension: str, timestamp: Optional[datetime] = None) -> str:
+    """
+    Generate backup filename with optional timestamp.
+    
+    Format with timestamp: container_name_DD_MM_YYYY_HH_MM.ext[.compression]
+    Format without timestamp: container_name.ext[.compression]
+    """
+    if timestamp:
+        timestamp_str = timestamp.strftime("%d_%m_%Y_%H_%M")
+        return f"{container_name}_{timestamp_str}.{file_extension}{compression_extension}"
+    else:
+        return f"{container_name}.{file_extension}{compression_extension}"
+
+
 @pycron.cron(SCHEDULE)
 def backup(now: datetime) -> None:
     print("Starting backup...")
@@ -204,10 +225,15 @@ def backup(now: datetime) -> None:
         if backup_provider is None:
             continue
 
-        backup_file = (
-            BACKUP_DIR
-            / f"{container.name}.{backup_provider.file_extension}{get_compressed_file_extension(COMPRESSION)}"
+        compression_extension = get_compressed_file_extension(COMPRESSION)
+        timestamp_for_filename = now if TIMESTAMP else None
+        backup_filename = generate_backup_filename(
+            container.name,
+            backup_provider.file_extension,
+            compression_extension,
+            timestamp_for_filename
         )
+        backup_file = BACKUP_DIR / backup_filename
         backup_temp_file_path = BACKUP_DIR / temp_backup_file_name()
 
         backup_command = backup_provider.backup_method(container)
