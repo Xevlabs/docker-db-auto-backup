@@ -6,7 +6,7 @@ import lzma
 import os
 import secrets
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 from typing import IO, Callable, Dict, Iterable, NamedTuple, Optional
@@ -163,6 +163,14 @@ SHOW_PROGRESS = sys.stdout.isatty()
 INCLUDE_LOGS = bool(os.environ.get("INCLUDE_LOGS"))
 TIMESTAMP = os.environ.get("TIMESTAMP", "").lower() == "true"
 COMPRESS = os.environ.get("COMPRESS", "").lower() == "true"
+RETENTION_DAYS = os.environ.get("RETENTION_DAYS")
+if RETENTION_DAYS:
+    try:
+        RETENTION_DAYS = int(RETENTION_DAYS)
+    except ValueError:
+        RETENTION_DAYS = None
+else:
+    RETENTION_DAYS = None
 
 # Determine compression algorithm
 if COMPRESS:
@@ -206,6 +214,74 @@ def generate_backup_filename(container_name: str, file_extension: str, compressi
         return f"{container_name}_{timestamp_str}.{file_extension}{compression_extension}"
     else:
         return f"{container_name}.{file_extension}{compression_extension}"
+
+
+def parse_timestamp_from_filename(filename: str) -> Optional[datetime]:
+    """
+    Try to extract timestamp from filename.
+    Expected format: container_name_DD_MM_YYYY_HH_MM.ext[.compression]
+    Returns None if timestamp cannot be parsed.
+    """
+    try:
+        # Remove extension(s) - could be .ext or .ext.compression
+        name_without_ext = filename.rsplit(".", 2)[0] if "." in filename else filename
+        
+        # Try to find pattern: _DD_MM_YYYY_HH_MM at the end
+        parts = name_without_ext.split("_")
+        if len(parts) >= 6:
+            # Last 5 parts should be: DD, MM, YYYY, HH, MM
+            day = int(parts[-5])
+            month = int(parts[-4])
+            year = int(parts[-3])
+            hour = int(parts[-2])
+            minute = int(parts[-1])
+            return datetime(year, month, day, hour, minute)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def clean_old_backups(retention_days: int, now: datetime) -> None:
+    """
+    Remove backup files older than retention_days.
+    
+    If TIMESTAMP is enabled, tries to extract date from filename.
+    Otherwise, uses file modification time.
+    """
+    if not BACKUP_DIR.exists():
+        return
+    
+    cutoff_date = now - timedelta(days=retention_days)
+    deleted_count = 0
+    
+    for backup_file in BACKUP_DIR.iterdir():
+        # Skip temporary files and directories
+        if backup_file.name.startswith(".auto-backup-") or backup_file.is_dir():
+            continue
+        
+        # Try to get file date
+        file_date: Optional[datetime] = None
+        
+        if TIMESTAMP:
+            # Try to extract date from filename first
+            file_date = parse_timestamp_from_filename(backup_file.name)
+        
+        # Fallback to file modification time
+        if file_date is None:
+            file_date = datetime.fromtimestamp(backup_file.stat().st_mtime)
+        
+        # Delete if older than retention period
+        if file_date < cutoff_date:
+            try:
+                backup_file.unlink()
+                deleted_count += 1
+                if not SHOW_PROGRESS:
+                    print(f"Deleted old backup: {backup_file.name}")
+            except OSError as e:
+                print(f"Error deleting {backup_file.name}: {e}")
+    
+    if deleted_count > 0:
+        print(f"Cleaned up {deleted_count} old backup file(s) (retention: {retention_days} days)")
 
 
 @pycron.cron(SCHEDULE)
@@ -266,6 +342,10 @@ def backup(now: datetime) -> None:
     print(
         f"Backup of {len(backed_up_containers)} containers complete in {duration:.2f} seconds."
     )
+
+    # Clean up old backups if retention is configured
+    if RETENTION_DAYS is not None:
+        clean_old_backups(RETENTION_DAYS, now)
 
     if success_hook_url := get_success_hook_url():
         if INCLUDE_LOGS:
